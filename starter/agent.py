@@ -61,12 +61,17 @@ MATERIALS = {
     "rayon", "fabric", "denim", "linen", "suede", "satin", "cashmere",
 }
 
+COLORS = {
+    "black", "white", "blue", "red", "pink", "green", "brown",
+    "gray", "grey", "purple", "yellow", "orange", "beige", "navy",
+}
+
 STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
     "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
     "that", "the", "this", "to", "want", "with", "would", "you", "looking",
-    "im", "still", "exploring", "not", "quite", "right", "yet", "have",
-    "dont", "prefer", "preference", "need", "need", "actually", "ignore",
+    "im", "still", "exploring", "quite", "right", "yet", "have",
+    "prefer", "preference", "need", "actually", "ignore",
     "earlier", "what", "matters", "key", "requirement", "about", "one",
     "specific", "attribute", "ask", "judgment", "use", "your", "additional",
 }
@@ -83,9 +88,28 @@ RE_OPEN_GENERIC = re.compile(r"^i'm looking for (.+?)\. (.+?)\.?$", re.I)
 RE_OPEN_BARE = re.compile(r"^i'm looking for (.+?)\.?$", re.I)
 RE_REVEAL = re.compile(r"what matters is:\s*(.+?)\.?$", re.I)
 RE_OVERRIDE = re.compile(r"ignore my earlier preference\.\s*what i need is:\s*(.+?)\.?$", re.I)
-RE_NOTHING_MORE = re.compile(r"(?:don't|do not) have an additional preference for ([a-z_]+)", re.I)
-RE_NO_OPINION = re.compile(r"(?:don't|do not) have a(?:ny)? (?:strong )?preference (?:for|on|about) ([a-z_]+)", re.I)
+RE_NOTHING_MORE = re.compile(
+    r"(?:(?:don'?t|do not) have an additional preference for|nothing (?:else|more) to add on|"
+    r"no extra requirement for|(?:i'?m |im )?easy on)\s+([a-z_]+)", re.I)
+RE_NO_OPINION = re.compile(
+    r"(?:(?:don'?t|do not) have a(?:ny)? (?:strong )?preference (?:for|on|about)|"
+    r"no strong feelings (?:about|on)|(?:i'?m |im )?flexible on|whatever works for)\s+([a-z_]+)", re.I)
 RE_COLOR_CONSTRAINT = re.compile(r"^colou?r:\s*(.+)$", re.I)
+# Values the customer rules out. Treating these as wants is actively harmful:
+# "definitely not leather" must penalise leather, not promote it.
+RE_EXCLUSION = re.compile(
+    r"(?:anything except|anything but|please avoid|definitely not|do not want|"
+    r"don'?t want|(?:i'?d )?rather avoid|steer clear of)\s+"
+    r"(?P<term>[a-z0-9][a-z0-9 &/'-]{1,40})", re.I)
+RE_EXCLUSION_BARE = re.compile(r"\b(?:not|avoid)\s+(?P<term>[a-z]+)", re.I)
+# "I first thought leather, but no - spandex is what I want": the pivot splits
+# a rejected value from the real one.
+CONFLICT_PIVOTS = (
+    " but no ", " but actually ", "; actually make that ", ", actually make that ",
+    " actually make that ", "; go with ", " go with ",
+)
+CONFLICT_LEADINS = ("i first thought", "i was considering", "i was thinking", "forget")
+CONFLICT_TRAILERS = (" is what i want", " suits me better", " instead")
 RE_BUDGET_CONSTRAINT = re.compile(r"budget around \$?([0-9]+(?:\.[0-9]+)?)", re.I)
 RE_PRICE_IN_TEXT = re.compile(r"(?:\$|under |below |around |about )\s*([0-9]+(?:\.[0-9]+)?)", re.I)
 
@@ -113,6 +137,7 @@ W_PHRASE_TOKEN_CAP = 12
 W_OVERLAP_STRONG = 4.0       # partial (token-level) requirement match
 W_OVERLAP_WEAK = 1.5
 W_ATTRIBUTE_HIT = 1.5        # material / colour mentioned by the customer
+W_EXCLUDE = 8.0              # penalty when a product matches something ruled out
 W_BUDGET_CLOSE = 3.0
 W_BUDGET_NEAR = 1.5
 W_BUDGET_OFF = -0.75
@@ -126,22 +151,30 @@ IDF_SPAN = 6.00              # ... amplified when rarely satisfied across the po
 RETRACTED_WEIGHT = 0.45      # overridden preferences stay as a weak prior
 FREE_TEXT_WEIGHT = 0.70      # requirements recovered from unstructured phrasing
 FUZZY_CATEGORY_FLOOR = 0.60  # minimum token overlap to accept a fuzzy product type
+
 LLM_WEIGHT = 0.90            # requirements recovered by the optional LLM extractor
 LLM_RERANK_DEPTH = 20        # how many candidates the optional reranker may reorder
 
 EXTRACT_SYSTEM = (
     "You extract shopping requirements from one customer message in a product-search chat. "
     "Reply with a single JSON object and no prose, using exactly these keys: "
-    '{"product_type": string|null, "requirements": [string], '
+    '{"product_type": string|null, "category_terms": [string], '
+    '"requirements": [string], "exclusions": [string], '
     '"retracts_earlier": boolean, "nothing_more_to_add": boolean}. '
     "product_type is the kind of item wanted (e.g. \"running shoes\", \"pendant necklace\"), "
     "or null if this message does not say. "
+    "category_terms are 2-5 alternative words a RETAIL CATALOG would use for that "
+    'product type, most likely first ("trainers" -> ["sneakers", "athletic shoes", '
+    '"shoes"]); [] if product_type is null. '
     "requirements are the attributes the customer states - material, colour, size, style, "
     "use case, budget, features. "
     "CRITICAL: write each requirement the way it would appear in a product listing, not as "
     "conversational prose. Strip filler verbs and articles. Keep each to 1-5 words. "
     'Say "leather" not "made of leather"; "budget around $80" not "priced under $80"; '
     '"machine wash" not "it should be machine washable". Use [] if none are stated. '
+    "exclusions are values the customer rules OUT - what they say they do not want, "
+    'want to avoid, or reject ("not leather", "anything but black"); [] if none. '
+    "Never put a ruled-out value in requirements. "
     "retracts_earlier is true only if they withdraw or replace something said earlier. "
     "nothing_more_to_add is true only if they say they have no further preferences."
 )
@@ -186,6 +219,51 @@ def _coarse_category(values: list[str]) -> str:
             if part and part.lower() not in GENERIC_CATEGORY_LABELS:
                 cleaned.append(part)
     return " ".join(cleaned[-2:]) if cleaned else "clothing item"
+
+
+def _is_attribute_value(term: str) -> bool:
+    """True for a recognised material or colour, e.g. "leather", "navy".
+
+    Refusals are only honoured for these. Requirements are quoted from product
+    metadata, which is full of care instructions and idiom that *look* like
+    refusals - "Please avoid soaking the leather", "goes with your daily
+    t-shirt" - and must not be read as things the customer rejects.
+    """
+    cleaned = term.strip(" -,;.").lower()
+    return cleaned in MATERIALS or cleaned in COLORS
+
+
+def _split_conflict(text: str) -> tuple[str | None, str]:
+    """Split "I was thinking X, but actually Y" into (rejected X, wanted Y)."""
+    lowered = text.lower()
+    for pivot in CONFLICT_PIVOTS:
+        position = lowered.find(pivot)
+        if position == -1:
+            continue
+        old = text[:position].strip(" -,;\u2014")
+        new = text[position + len(pivot):].strip(" -,;\u2014")
+        for leadin in CONFLICT_LEADINS:
+            if old.lower().startswith(leadin):
+                old = old[len(leadin):].strip(" -,;")
+        for trailer in CONFLICT_TRAILERS:
+            if new.lower().endswith(trailer):
+                new = new[: -len(trailer)].strip(" -,;")
+        if old and new and _is_attribute_value(old):
+            return old, new
+    return None, text
+
+
+def _extract_exclusions(text: str) -> tuple[str, list[str]]:
+    """Pull ruled-out values out of a clause, returning (remainder, excluded)."""
+    excluded: list[str] = []
+    remainder = text
+    for pattern in (RE_EXCLUSION, RE_EXCLUSION_BARE):
+        for match in pattern.finditer(remainder):
+            term = match.group("term").strip(" -,;.")
+            if _is_attribute_value(term):
+                excluded.append(term.lower())
+                remainder = remainder.replace(match.group(0), " ")
+    return WS_RE.sub(" ", remainder).strip(" -,;."), excluded
 
 
 def _as_price(value: object) -> float | None:
@@ -428,8 +506,10 @@ class Agent:
             self._infer_category(state, text)
         for clause in re.split(r"[.;!?]", text):
             clause = _normalize(clause).strip(" -,")
-            if len(clause.split()) >= 3:
-                state.add("phrase", clause, weight=FREE_TEXT_WEIGHT)
+            # Short clauses carry no phrase signal, but "not leather" still must
+            # register, so anything with an exclusion goes through regardless.
+            if len(clause.split()) >= 3 or RE_EXCLUSION_BARE.search(clause):
+                self._add_constraint(state, clause, FREE_TEXT_WEIGHT)
         state.free_tokens.update(_content_tokens(text))
         return False
 
@@ -448,7 +528,11 @@ class Agent:
         product_type = parsed.get("product_type")
         if isinstance(product_type, str) and product_type.strip() and not state.category:
             # Map the model's wording onto a real catalog product type.
-            self._infer_category(state, product_type)
+            terms = parsed.get("category_terms")
+            self._infer_category(
+                state, product_type,
+                [t for t in terms[:5] if isinstance(t, str)] if isinstance(terms, list) else None,
+            )
         requirements = parsed.get("requirements")
         if isinstance(requirements, list):
             for requirement in requirements[:8]:
@@ -457,6 +541,12 @@ class Agent:
                     # requirement must come back at full strength.
                     self._add_constraint(state, requirement, LLM_WEIGHT,
                                          promote_existing=retracts)
+        exclusions = parsed.get("exclusions")
+        if isinstance(exclusions, list):
+            for term in exclusions[:6]:
+                if isinstance(term, str) and term.strip():
+                    state.add("exclude", _normalize(term).strip(" -;,."),
+                              LLM_WEIGHT, promote_existing=retracts)
         if parsed.get("nothing_more_to_add"):
             state.info_exhausted = True
 
@@ -495,13 +585,16 @@ class Agent:
         reordered.extend(asin for asin in ranked if asin not in seen)
         return reordered
 
-    def _infer_category(self, state: SessionState, text: str) -> None:
+    def _infer_category(self, state: SessionState, text: str,
+                        extra_terms: list[str] | None = None) -> None:
         """Recover the product type from free prose by matching bucket names."""
         tokens = _content_tokens(text)
+        for term in extra_terms or []:
+            tokens |= _content_tokens(term)
         if not tokens:
             return
         best_name: str | None = None
-        best_key = (0.0, 0)
+        best_key = (0.0, 0, 0)
         for name, name_tokens in self._bucket_tokens.items():
             if not name_tokens:
                 continue
@@ -511,7 +604,10 @@ class Agent:
             # Prefer well-covered names, then the most specific one: both
             # "shirts t-shirts" and "shirts tanks tops" are fully covered by
             # the latter's wording, and the longer match is the real type.
-            key = (matched / len(name_tokens), matched)
+            # ...then the larger bucket: the catalog carries tiny promotional
+            # categories ("shoes & jewelry 25% off harley davidson footwear")
+            # that match a generic word perfectly but are never the real type.
+            key = (matched / len(name_tokens), matched, len(self.buckets.get(name, ())))
             if key > best_key:
                 best_name, best_key = name, key
         if best_name and best_key[0] >= FUZZY_CATEGORY_FLOOR:
@@ -534,6 +630,18 @@ class Agent:
         promote_existing: bool = False,
     ) -> None:
         text = _normalize(raw).strip(" -;,.")
+        if not text:
+            return
+
+        # "I was thinking leather, but actually spandex" - the rejected value
+        # becomes an exclusion and the wanted one the requirement.
+        rejected, text = _split_conflict(text)
+        if rejected:
+            state.add("exclude", rejected, promote_existing=promote_existing)
+
+        text, excluded = _extract_exclusions(text)
+        for term in excluded:
+            state.add("exclude", term, promote_existing=promote_existing)
         if not text:
             return
 
@@ -615,6 +723,16 @@ class Agent:
                 strength = self._budget_score(index, constraint)
                 if strength:
                     hits.append((position, constraint.weight * strength))
+                continue
+            if constraint.kind == "exclude":
+                if len(constraint.tokens) == 1:
+                    if tokens is None:
+                        tokens = self._blob_tokens(index)
+                    matched = next(iter(constraint.tokens)) in tokens
+                else:
+                    matched = bool(constraint.text) and constraint.text in blob
+                if matched:
+                    hits.append((position, -constraint.weight * W_EXCLUDE))
                 continue
             if constraint.kind in ("material", "color"):
                 if constraint.text in blob:

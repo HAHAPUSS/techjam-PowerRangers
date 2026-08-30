@@ -16,3 +16,13 @@ docs/participant_release_checklist.md
 tests/test_5core_builder.py
 tests/test_organizer_pipeline.py
 *.log
+
+# Large organizer artifact: fetch from the GitHub Release, do not commit.
+catalog.jsonl.gz
+
+# Benchmark run outputs.
+stress_results.json
+
+# Team-internal robustness benchmarks and working report.
+benchmarks/
+REPORT.md
