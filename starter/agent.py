@@ -70,8 +70,8 @@ STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from",
     "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "some",
     "that", "the", "this", "to", "want", "with", "would", "you", "looking",
-    "im", "still", "exploring", "not", "quite", "right", "yet", "have",
-    "dont", "prefer", "preference", "need", "need", "actually", "ignore",
+    "im", "still", "exploring", "quite", "right", "yet", "have",
+    "prefer", "preference", "need", "actually", "ignore",
     "earlier", "what", "matters", "key", "requirement", "about", "one",
     "specific", "attribute", "ask", "judgment", "use", "your", "additional",
 }
@@ -95,10 +95,8 @@ RE_NO_OPINION = re.compile(
     r"(?:(?:don'?t|do not) have a(?:ny)? (?:strong )?preference (?:for|on|about)|"
     r"no strong feelings (?:about|on)|(?:i'?m |im )?flexible on|whatever works for)\s+([a-z_]+)", re.I)
 RE_COLOR_CONSTRAINT = re.compile(r"^colou?r:\s*(.+)$", re.I)
-# Things the customer rules out. Treating these as wants is actively harmful:
+# Values the customer rules out. Treating these as wants is actively harmful:
 # "definitely not leather" must penalise leather, not promote it.
-# Explicit refusal: the customer is clearly stating a preference, so any value
-# after it is a genuine exclusion.
 RE_EXCLUSION = re.compile(
     r"(?:anything except|anything but|please avoid|definitely not|do not want|"
     r"don'?t want|(?:i'?d )?rather avoid|steer clear of)\s+"
@@ -153,16 +151,21 @@ IDF_SPAN = 6.00              # ... amplified when rarely satisfied across the po
 RETRACTED_WEIGHT = 0.45      # overridden preferences stay as a weak prior
 FREE_TEXT_WEIGHT = 0.70      # requirements recovered from unstructured phrasing
 FUZZY_CATEGORY_FLOOR = 0.60  # minimum token overlap to accept a fuzzy product type
+
 LLM_WEIGHT = 0.90            # requirements recovered by the optional LLM extractor
 LLM_RERANK_DEPTH = 20        # how many candidates the optional reranker may reorder
 
 EXTRACT_SYSTEM = (
     "You extract shopping requirements from one customer message in a product-search chat. "
     "Reply with a single JSON object and no prose, using exactly these keys: "
-    '{"product_type": string|null, "requirements": [string], "exclusions": [string], '
+    '{"product_type": string|null, "category_terms": [string], '
+    '"requirements": [string], "exclusions": [string], '
     '"retracts_earlier": boolean, "nothing_more_to_add": boolean}. '
     "product_type is the kind of item wanted (e.g. \"running shoes\", \"pendant necklace\"), "
     "or null if this message does not say. "
+    "category_terms are 2-5 alternative words a RETAIL CATALOG would use for that "
+    'product type, most likely first ("trainers" -> ["sneakers", "athletic shoes", '
+    '"shoes"]); [] if product_type is null. '
     "requirements are the attributes the customer states - material, colour, size, style, "
     "use case, budget, features. "
     "CRITICAL: write each requirement the way it would appear in a product listing, not as "
@@ -505,7 +508,7 @@ class Agent:
             clause = _normalize(clause).strip(" -,")
             # Short clauses carry no phrase signal, but "not leather" still must
             # register, so anything with an exclusion goes through regardless.
-            if len(clause.split()) >= 3 or RE_EXCLUSION.search(clause):
+            if len(clause.split()) >= 3 or RE_EXCLUSION_BARE.search(clause):
                 self._add_constraint(state, clause, FREE_TEXT_WEIGHT)
         state.free_tokens.update(_content_tokens(text))
         return False
@@ -525,7 +528,11 @@ class Agent:
         product_type = parsed.get("product_type")
         if isinstance(product_type, str) and product_type.strip() and not state.category:
             # Map the model's wording onto a real catalog product type.
-            self._infer_category(state, product_type)
+            terms = parsed.get("category_terms")
+            self._infer_category(
+                state, product_type,
+                [t for t in terms[:5] if isinstance(t, str)] if isinstance(terms, list) else None,
+            )
         requirements = parsed.get("requirements")
         if isinstance(requirements, list):
             for requirement in requirements[:8]:
@@ -578,13 +585,16 @@ class Agent:
         reordered.extend(asin for asin in ranked if asin not in seen)
         return reordered
 
-    def _infer_category(self, state: SessionState, text: str) -> None:
+    def _infer_category(self, state: SessionState, text: str,
+                        extra_terms: list[str] | None = None) -> None:
         """Recover the product type from free prose by matching bucket names."""
         tokens = _content_tokens(text)
+        for term in extra_terms or []:
+            tokens |= _content_tokens(term)
         if not tokens:
             return
         best_name: str | None = None
-        best_key = (0.0, 0)
+        best_key = (0.0, 0, 0)
         for name, name_tokens in self._bucket_tokens.items():
             if not name_tokens:
                 continue
@@ -594,7 +604,10 @@ class Agent:
             # Prefer well-covered names, then the most specific one: both
             # "shirts t-shirts" and "shirts tanks tops" are fully covered by
             # the latter's wording, and the longer match is the real type.
-            key = (matched / len(name_tokens), matched)
+            # ...then the larger bucket: the catalog carries tiny promotional
+            # categories ("shoes & jewelry 25% off harley davidson footwear")
+            # that match a generic word perfectly but are never the real type.
+            key = (matched / len(name_tokens), matched, len(self.buckets.get(name, ())))
             if key > best_key:
                 best_name, best_key = name, key
         if best_name and best_key[0] >= FUZZY_CATEGORY_FLOOR:
