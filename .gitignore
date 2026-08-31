@@ -26,3 +26,6 @@ stress_results.json
 # Team-internal robustness benchmarks and working report.
 benchmarks/
 REPORT.md
+
+# Local demo harness for the walkthrough video.
+demo_session.py
