@@ -150,7 +150,7 @@ IDF_FLOOR = 1.00             # matched requirements keep full strength ...
 IDF_SPAN = 6.00              # ... amplified when rarely satisfied across the pool
 RETRACTED_WEIGHT = 0.45      # overridden preferences stay as a weak prior
 FREE_TEXT_WEIGHT = 0.70      # requirements recovered from unstructured phrasing
-FUZZY_CATEGORY_FLOOR = 0.60  # minimum token overlap to accept a fuzzy product type
+FUZZY_CATEGORY_FLOOR = 0.50  # minimum token overlap to accept a fuzzy product type
 
 LLM_WEIGHT = 0.90            # requirements recovered by the optional LLM extractor
 LLM_RERANK_DEPTH = 20        # how many candidates the optional reranker may reorder
@@ -193,6 +193,23 @@ def _normalize(text: str) -> str:
 
 def _tokens(text: str) -> list[str]:
     return TOKEN_RE.findall(text.lower())
+
+
+def _fold(token: str) -> str:
+    """Crude singular form, so "sweater" matches the catalog's "sweaters".
+
+    Category names are plural ("Sweaters Pullovers") and customers speak in the
+    singular. Applied to both sides so the two meet in the middle.
+    """
+    if len(token) > 4 and token.endswith(("ches", "shes", "sses", "xes", "zes")):
+        return token[:-2]
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _folded_tokens(text: str) -> set[str]:
+    return {_fold(token) for token in _content_tokens(text)}
 
 
 def _content_tokens(text: str) -> set[str]:
@@ -347,6 +364,7 @@ class Agent:
         self.coarse: list[str] = []
         self.buckets: dict[str, list[int]] = {}
         self._bucket_tokens: dict[str, set[str]] = {}
+        self._bucket_folded: dict[str, set[str]] = {}
         self._token_cache: dict[int, set[str]] = {}
         self._sessions: dict[str, SessionState] = {}
         self._build_index()
@@ -380,6 +398,7 @@ class Agent:
                 )
                 self.buckets.setdefault(coarse.lower(), []).append(index)
         self._bucket_tokens = {name: _content_tokens(name) for name in self.buckets}
+        self._bucket_folded = {name: _folded_tokens(name) for name in self.buckets}
 
     def _blob_tokens(self, index: int) -> set[str]:
         tokens = self._token_cache.get(index)
@@ -479,24 +498,24 @@ class Agent:
 
         buying = RE_OPEN_BUYING.match(text)
         if buying:
-            self._set_category(state, buying.group(1))
+            self._resolve_category(state, buying.group(1))
             self._add_constraint(state, buying.group(2))
             return True
 
         browsing = RE_OPEN_BROWSING.match(text)
         if browsing:
-            self._set_category(state, browsing.group(1))
+            self._resolve_category(state, browsing.group(1))
             return True
 
         generic = RE_OPEN_GENERIC.match(text)
         if generic:
-            self._set_category(state, generic.group(1))
+            self._resolve_category(state, generic.group(1))
             self._add_constraint(state, generic.group(2))
             return True
 
         bare = RE_OPEN_BARE.match(text)
         if bare:
-            self._set_category(state, bare.group(1))
+            self._resolve_category(state, bare.group(1))
             return True
 
         # Unrecognised phrasing (e.g. a paraphrased customer). Degrade
@@ -588,14 +607,14 @@ class Agent:
     def _infer_category(self, state: SessionState, text: str,
                         extra_terms: list[str] | None = None) -> None:
         """Recover the product type from free prose by matching bucket names."""
-        tokens = _content_tokens(text)
+        tokens = _folded_tokens(text)
         for term in extra_terms or []:
-            tokens |= _content_tokens(term)
+            tokens |= _folded_tokens(term)
         if not tokens:
             return
         best_name: str | None = None
         best_key = (0.0, 0, 0)
-        for name, name_tokens in self._bucket_tokens.items():
+        for name, name_tokens in self._bucket_folded.items():
             if not name_tokens:
                 continue
             matched = len(name_tokens & tokens)
@@ -612,6 +631,21 @@ class Agent:
                 best_name, best_key = name, key
         if best_name and best_key[0] >= FUZZY_CATEGORY_FLOOR:
             self._set_category(state, best_name)
+
+    def _resolve_category(self, state: SessionState, text: str) -> None:
+        """Accept a stated product type only if the catalog actually has it.
+
+        The opening templates name a real category verbatim, so the direct hit
+        is the normal path. Free-form phrasing ("I'm looking for women's
+        sweaters, cotton, not leather") would otherwise store the entire
+        sentence as the product type, match no bucket, and — because a category
+        now looks "set" — block the fuzzy inference that would have found it.
+        """
+        candidate = _normalize(text)
+        if candidate in self.buckets:
+            self._set_category(state, candidate)
+            return
+        self._infer_category(state, text)
 
     def _set_category(self, state: SessionState, category: str) -> None:
         category = _normalize(category)
